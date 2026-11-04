@@ -7,17 +7,13 @@ use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 // * Telegram 官网直装版标准权限表兜底模板（关闭沙盒，保留 Group Container 与音视频权限）
+// * 本地 Ad-hoc 签名专用干净权限表（剔除带官方 TeamID 的 application-groups，防止 macOS 26/27 TCC 拦截与闪退）
 const DEFAULT_TELEGRAM_ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>com.apple.security.app-sandbox</key>
     <false/>
-    <key>com.apple.security.application-groups</key>
-    <array>
-        <string>6N38VWS5BX.ru.keepcoder.Telegram</string>
-        <string>6N38VWS5BX.ru.keepcoder.Telegram.TelegramShare</string>
-    </array>
     <key>com.apple.security.device.audio-input</key>
     <true/>
     <key>com.apple.security.device.camera</key>
@@ -29,28 +25,29 @@ const DEFAULT_TELEGRAM_ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF
 "#;
 
 // * 提取原版 Telegram.app 的权限表 XML（若提取失败或已被破坏则回退使用标准模板）
-pub fn extract_or_default_entitlements(app_path: &Path) -> String {
-    let output = Command::new("/usr/bin/codesign")
-        .arg("-d")
-        .arg("--entitlements")
-        .arg(":-")
-        .arg(app_path)
-        .output();
-
-    if let Ok(out) = output
-        && out.status.success()
-    {
-        let xml = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if xml.contains("<plist") && xml.contains("6N38VWS5BX.ru.keepcoder.Telegram") {
-            // ! 确保关闭强制沙盒，避免 Ad-hoc 签名下被 secinitd 拦截
-            if !xml.contains("<key>com.apple.security.app-sandbox</key><true/>") {
-                debug!("成功提取原版 Telegram.app 权限表");
-                return xml;
-            }
-        }
-    }
-
+pub fn extract_or_default_entitlements(_app_path: &Path) -> String {
+    debug!("使用已剥离跨团队 Group Container 校验的干净权限表");
     DEFAULT_TELEGRAM_ENTITLEMENTS.to_string()
+    // let output = Command::new("/usr/bin/codesign")
+    //     .arg("-d")
+    //     .arg("--entitlements")
+    //     .arg(":-")
+    //     .arg(app_path)
+    //     .output();
+
+    // if let Ok(out) = output
+    //     && out.status.success()
+    // {
+    //     let xml = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    //     if xml.contains("<plist") && xml.contains("6N38VWS5BX.ru.keepcoder.Telegram") {
+    //         // ! 确保关闭强制沙盒，避免 Ad-hoc 签名下被 secinitd 拦截
+    //         if !xml.contains("<key>com.apple.security.app-sandbox</key><true/>") {
+    //             debug!("成功提取原版 Telegram.app 权限表");
+    //             return xml;
+    //         }
+    //     }
+    // }
+    // DEFAULT_TELEGRAM_ENTITLEMENTS.to_string()
 }
 
 // * 对单个目标执行静默 Ad-hoc 签名

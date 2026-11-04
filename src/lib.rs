@@ -1,4 +1,3 @@
-
 // * tg-patcher 核心库入口：CLI 参数定义、交互式多选菜单与汇总报表输出
 
 pub mod features;
@@ -18,16 +17,27 @@ use tracing_subscriber::FmtSubscriber;
     name = "tg-patcher",
     author = "sora",
     version,
-    about = "macOS 原生 Telegram 客户端 (Telegram-Mac) 增强补丁、热切换菜单与架构瘦身工具"
+    about = "macOS 原生 Telegram 客户端 (Telegram-Mac) 增强补丁、热切换菜单与架构精简工具"
 )]
 pub struct CliArgs {
     // * 跳过交互确认，以默认全选配置直接执行
-    #[arg(short = 'y', long = "yes", help = "跳过交互菜单，使用默认配置全自动执行")]
+    #[arg(
+        short = 'y',
+        long = "yes",
+        help = "跳过交互菜单，使用默认配置全自动执行"
+    )]
     pub yes: bool,
 
     // * 跳过注入增强补丁动态库
     #[arg(long = "no-core", help = "跳过注入 libtg_patch.dylib 增强补丁")]
     pub no_core: bool,
+
+    // * 跳过删除无用组件
+    #[arg(
+        long = "no-bloat",
+        help = "跳过删除 TelegramShare.appex 与 Autoupdate.app"
+    )]
+    pub no_bloat: bool,
 
     // * 跳过语言包精简
     #[arg(long = "no-locales", help = "跳过删除多余的 .lproj 语言包")]
@@ -54,6 +64,7 @@ impl CliArgs {
     pub fn to_patch_options(&self) -> PatchOptions {
         PatchOptions {
             core_patch: !self.no_core,
+            remove_bloatware: !self.no_bloat,
             prune_locales: !self.no_locales,
             thin_arm64: !self.no_thin,
         }
@@ -125,13 +136,24 @@ pub fn print_summary(report: &PatchReport) {
         );
     }
 
+    if !report.removed_components.is_empty() {
+        println!(
+            "  清理组件: 已移除 {} 个 ({})",
+            report.removed_components.len(),
+            report.removed_components.join(", ")
+        );
+    }
+
     if report.pruned_locales_count > 0 {
-        println!("  语言精简: 已移除 {} 个冗余语言包", report.pruned_locales_count);
+        println!(
+            "  语言精简: 已移除 {} 个冗余语言包",
+            report.pruned_locales_count
+        );
     }
 
     if report.thinned_count > 0 {
         println!(
-            "  架构瘦身: {} 个二进制完成纯 arm64 转换",
+            "  架构精简: {} 个二进制完成纯 arm64 转换",
             report.thinned_count
         );
     }
@@ -163,10 +185,11 @@ pub fn run() {
     let options = if is_interactive {
         let items = [
             "1. 注入增强补丁 (顶部「⚡ 增强设置」热切换 / 破防截屏 / 屏蔽频道广告 / 解除禁止选中 / 禁用自动更新)",
-            "2. 清理多余语言包 (仅保留简繁中文与英文)",
-            "3. 提取纯 arm64 架构 (lipo 剥离主程序与 28 个 Swift 库的 x86_64 代码)",
+            "2. 删除无用组件 (移除 42MB 的 TelegramShare.appex 分享扩展与 Autoupdate.app)",
+            "3. 清理多余语言包 (仅保留简繁中文与英文)",
+            "4. 提取纯 arm64 架构 (lipo 剥离主程序与 28 个 Swift 库的 x86_64 代码)",
         ];
-        let defaults = [true, true, true];
+        let defaults = [true, true, true, true];
 
         println!();
         println!("请选择需要执行的项目 (空格切换，回车确认):");
@@ -174,12 +197,13 @@ pub fn run() {
             .items(&items)
             .defaults(&defaults)
             .interact()
-            .unwrap_or_else(|_| vec![0, 1, 2]);
+            .unwrap_or_else(|_| vec![0, 1, 2, 3]);
 
         PatchOptions {
             core_patch: selections.contains(&0),
-            prune_locales: selections.contains(&1),
-            thin_arm64: selections.contains(&2),
+            remove_bloatware: selections.contains(&1),
+            prune_locales: selections.contains(&2),
+            thin_arm64: selections.contains(&3),
         }
     } else {
         args.to_patch_options()

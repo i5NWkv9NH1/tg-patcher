@@ -400,14 +400,28 @@ pub fn scan_arm64_string_xrefs(
         }
     }
 
-    // * 3. 搜索目标字符串在切片内的文件偏移并换算为虚拟地址 (VA)
-    let mut targets: Vec<(&str, u64)> = Vec::new();
+    // * 3. 搜索目标字符串，并自动向前回溯到 '\0' 边界以获取整条 C 字符串的真实起始虚拟地址
+    let mut targets: std::collections::HashMap<u64, &str> = std::collections::HashMap::new();
     for &needle in needles {
         let nb = needle.as_bytes();
-        if let Some(pos) = slice.windows(nb.len()).position(|w| w == nb) {
-            // ! 确保匹配的是完整字符串或后缀锚点
-            let va = text_vmaddr + (pos.saturating_sub(text_fileoff)) as u64;
-            targets.push((needle, va));
+        if nb.is_empty() || slice.len() < nb.len() {
+            continue;
+        }
+        let mut search_from = 0;
+        while let Some(rel_pos) = slice[search_from..].windows(nb.len()).position(|w| w == nb) {
+            let pos = search_from + rel_pos;
+            // ! 向前回溯到上一个 '\0' 字节，定位如 "/Users/.../CopyProtection.swift" 的真正首字节 '/'
+            let mut cstr_start = pos;
+            while cstr_start > 0 && slice[cstr_start - 1] != 0 && (pos - cstr_start) < 256 {
+                cstr_start -= 1;
+            }
+
+            let exact_va = text_vmaddr + (pos.saturating_sub(text_fileoff)) as u64;
+            let start_va = text_vmaddr + (cstr_start.saturating_sub(text_fileoff)) as u64;
+            targets.insert(exact_va, needle);
+            targets.insert(start_va, needle);
+
+            search_from = pos + nb.len();
         }
     }
 
@@ -419,51 +433,39 @@ pub fn scan_arm64_string_xrefs(
     let code_bytes = &slice[code_sec_offset..code_sec_offset + code_sec_size];
     let code_base_va = text_vmaddr + (code_sec_offset.saturating_sub(text_fileoff)) as u64;
 
-    // * 4. 扫描 __TEXT,__text 全部 ARM64 指令对 (ADRP Xd, page + ADD Xd, Xd, #off12)
+    // * 4. 维护 32 个通用寄存器的最近一次 ADRP 页基址状态：(page_va, adrp_pc)
+    let mut adrp_regs: [(u64, u64); 32] = [(0, 0); 32];
     let insn_count = code_bytes.len() / 4;
-    for i in 0..insn_count.saturating_sub(1) {
-        let insn1 = u32::from_le_bytes(code_bytes[i * 4..i * 4 + 4].try_into().unwrap());
-        // ! 判断是否为 ADRP 指令: (insn & 0x9F000000) == 0x90000000
-        if (insn1 & 0x9F000000) != 0x90000000 {
+
+    for i in 0..insn_count {
+        let insn = u32::from_le_bytes(code_bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        let pc = code_base_va + (i as u64) * 4;
+
+        // * 分支 A: 识别 ADRP Xd, page 指令
+        if (insn & 0x9F000000) == 0x90000000 {
+            let rd = (insn & 0x1F) as usize;
+            let immlo = (insn >> 29) & 0x3;
+            let immhi = (insn >> 5) & 0x7FFFF;
+            let raw_imm21 = (immhi << 2) | immlo;
+            let signed_imm21 = ((raw_imm21 as i32) << 11) >> 11;
+            let page_offset = (signed_imm21 as i64) << 12;
+            let target_page = ((pc & !0xFFF) as i64 + page_offset) as u64;
+            adrp_regs[rd] = (target_page, pc);
             continue;
         }
 
-        let rd1 = insn1 & 0x1F;
-        let immlo = (insn1 >> 29) & 0x3;
-        let immhi = (insn1 >> 5) & 0x7FFFF;
-        let raw_imm21 = (immhi << 2) | immlo;
-        // * 21 位有符号页偏移扩展为 i64 并左移 12 位
-        let signed_imm21 = ((raw_imm21 as i32) << 11) >> 11;
-        let page_offset = (signed_imm21 as i64) << 12;
+        // * 分支 B: 识别 64位 ADD Xd, Xn, #imm12 指令 (shift = 0)
+        if (insn & 0xFFC00000) == 0x91000000 {
+            let rn = ((insn >> 5) & 0x1F) as usize;
+            let rd = (insn & 0x1F) as usize;
+            let imm12 = ((insn >> 10) & 0xFFF) as u64;
 
-        let pc = code_base_va + (i as u64) * 4;
-        let target_page = ((pc & !0xFFF) as i64 + page_offset) as u64;
-
-        // * 检查紧随其后的 1~2 条指令是否为 ADD Xd, Xd, #imm12
-        for lookahead in 1..=2 {
-            if i + lookahead >= insn_count {
-                break;
-            }
-            let insn2 = u32::from_le_bytes(
-                code_bytes[(i + lookahead) * 4..(i + lookahead) * 4 + 4]
-                    .try_into()
-                    .unwrap(),
-            );
-            // ! 64位 ADD (immediate, shift=0): (insn2 & 0xFFC00000) == 0x91000000
-            if (insn2 & 0xFFC00000) != 0x91000000 {
-                continue;
-            }
-            let rn2 = (insn2 >> 5) & 0x1F;
-            if rn2 != rd1 {
-                continue;
-            }
-            let imm12 = ((insn2 >> 10) & 0xFFF) as u64;
-            let resolved_va = target_page + imm12;
-
-            for &(needle, str_va) in &targets {
-                if resolved_va == str_va {
-                    // * 二分查找包含当前指令的所属函数起始地址
-                    let func_start = match function_starts.binary_search(&pc) {
+            let (page_va, adrp_pc) = adrp_regs[rn];
+            // ! 若 Xn 在最近 16 条指令 (64 字节) 内刚由 ADRP 赋值，则组合计算出目标虚拟地址
+            if page_va != 0 && pc.saturating_sub(adrp_pc) <= 64 {
+                let resolved_va = page_va + imm12;
+                if let Some(&needle) = targets.get(&resolved_va) {
+                    let func_start = match function_starts.binary_search(&adrp_pc) {
                         Ok(exact_idx) => Some(function_starts[exact_idx]),
                         Err(insert_idx) if insert_idx > 0 => Some(function_starts[insert_idx - 1]),
                         _ => None,
@@ -487,12 +489,16 @@ pub fn scan_arm64_string_xrefs(
 
                     results.push(Arm64XrefMatch {
                         needle: needle.to_string(),
-                        string_va: str_va,
-                        xref_insn_va: pc,
+                        string_va: resolved_va,
+                        xref_insn_va: adrp_pc,
                         func_start_va: func_start,
                         prologue_insns: prologue,
                     });
                 }
+            }
+            // ! 若 ADD 覆写了某寄存器但不是基于其自身的 ADRP，清除旧状态避免误判
+            if rd != rn {
+                adrp_regs[rd] = (0, 0);
             }
         }
     }

@@ -1,11 +1,13 @@
-// * 核心补丁流水线切片：串联进程清理、语言包精简、arm64 瘦身、动态库注入与保活重签名
+// * 核心补丁流水线切片：串联进程清理、语言包精简、arm64 精简、动态库注入与保活重签名
 
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use tracing::{debug, info, warn};
 
-use crate::features::clean::{calculate_dir_size, format_size, prune_locales, thin_arm64_binaries};
+use crate::features::clean::{
+    calculate_dir_size, format_size, prune_locales, remove_bloatware, thin_arm64_binaries,
+};
 use crate::features::macho::{InjectResult, inject_file};
 use crate::features::sign::{extract_or_default_entitlements, resign_telegram_bundle};
 
@@ -17,9 +19,11 @@ pub const PATCH_DYLIB_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/l
 pub struct PatchOptions {
     // * 1. 注入增强补丁动态库 (顶部「⚡ 增强设置」热切换菜单 / 破防截屏 / 去广告 / 解除禁止选中)
     pub core_patch: bool,
-    // * 2. 删除多余语言包 (.lproj)
+    // * 2. 删除无用组件 (TelegramShare.appex 分享插件 / Sparkle 自动更新器)
+    pub remove_bloatware: bool,
+    // * 3. 删除多余语言包 (.lproj)
     pub prune_locales: bool,
-    // * 3. 提取纯 arm64 架构 (lipo 移除主程序与 28 个 Swift 动态库中的 x86_64 代码)
+    // * 4. 提取纯 arm64 架构 (lipo 移除主程序与 28 个 Swift 动态库中的 x86_64 代码)
     pub thin_arm64: bool,
 }
 
@@ -27,18 +31,19 @@ impl Default for PatchOptions {
     fn default() -> Self {
         Self {
             core_patch: true,
+            remove_bloatware: true,
             prune_locales: true,
             thin_arm64: true,
         }
     }
 }
-
 // * 处理结果统计报表
 #[derive(Debug, Default)]
 pub struct PatchReport {
     pub initial_size: u64,
     pub final_size: u64,
     pub inject_status: Option<InjectResult>,
+    pub removed_components: Vec<String>,
     pub pruned_locales_count: usize,
     pub thinned_count: usize,
 }
@@ -75,6 +80,23 @@ pub fn run_pipeline(options: &PatchOptions) -> Result<PatchReport, String> {
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
+    // * 2.5 移除无用组件 (TelegramShare.appex 与 Autoupdate.app)
+    if options.remove_bloatware {
+        match remove_bloatware(&app_path) {
+            Ok(removed) => {
+                if !removed.is_empty() {
+                    info!(
+                        "已删除无用组件: {} 项 ({})",
+                        removed.len(),
+                        removed.join(", ")
+                    );
+                }
+                report.removed_components = removed;
+            }
+            Err(e) => warn!("移除无用组件时遇到异常: {e}"),
+        }
+    }
+
     // * 3. 精简多国语言包
     if options.prune_locales {
         match prune_locales(&app_path) {
@@ -88,7 +110,7 @@ pub fn run_pipeline(options: &PatchOptions) -> Result<PatchReport, String> {
         }
     }
 
-    // * 4. 提取纯 arm64 架构 (在注入前完成二进制瘦身)
+    // * 4. 提取纯 arm64 架构 (在注入前完成二进制精简)
     if options.thin_arm64 {
         match thin_arm64_binaries(&app_path) {
             Ok(count) => {

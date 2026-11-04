@@ -1,20 +1,11 @@
 // * 纯 Rust 编写的 macOS 原生 Telegram 客户端注入动态库 (libtg_patch.dylib)
-// * 提供顶部系统菜单栏「⚡ 增强设置」实时热切换、防截屏破除、去频道底部广告、解除受限群复制选中限制与屏蔽自动更新
+// * 支持中英双语顶部菜单栏「⚡ 增强设置 / ⚡ Patcher」实时热切换、防截屏破除、ARM64 内存级去频道气泡广告、解除禁止复制与屏蔽自动更新
 
 use std::ffi::{CStr, CString, c_char, c_int, c_ulong, c_void};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Once;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-// * 1. 核心数据结构与几何类型定义
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct CGPoint {
-    pub x: f64,
-    pub y: f64,
-}
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -23,26 +14,39 @@ pub struct CGSize {
     pub height: f64,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct CGRect {
-    pub origin: CGPoint,
-    pub size: CGSize,
-}
-
-// * 2. 运行时热切换全局原子开关（默认全部开启，支持在顶部菜单栏实时切换并落盘）
-
+// * 运行时热切换全局原子开关
 static OPT_ALLOW_SCREENSHOT: AtomicBool = AtomicBool::new(true);
 static OPT_HIDE_SPONSORED: AtomicBool = AtomicBool::new(true);
 static OPT_UNLOCK_COPY: AtomicBool = AtomicBool::new(true);
 static OPT_DISABLE_SPARKLE: AtomicBool = AtomicBool::new(true);
-static OPT_LOCAL_PREMIUM_FLAG: AtomicBool = AtomicBool::new(false);
+static OPT_LANG_EN: AtomicBool = AtomicBool::new(false);
+
+// * 缓存菜单项指针以支持运行时一键切换中英文标题
+static MENU_SUB_PTR: AtomicUsize = AtomicUsize::new(0);
+static ITEM_SS_PTR: AtomicUsize = AtomicUsize::new(0);
+static ITEM_AD_PTR: AtomicUsize = AtomicUsize::new(0);
+static ITEM_CP_PTR: AtomicUsize = AtomicUsize::new(0);
+static ITEM_SP_PTR: AtomicUsize = AtomicUsize::new(0);
+static ITEM_LANG_PTR: AtomicUsize = AtomicUsize::new(0);
 
 static MENU_INJECTED: Once = Once::new();
 
-// * 3. Objective-C Runtime 与系统底层 C 接口声明
-
 unsafe extern "C" {
+    static mach_task_self_: u32;
+    fn getpagesize() -> c_int;
+    fn sys_icache_invalidate(start: *mut c_void, len: usize);
+    fn vm_protect(
+        target_task: u32,
+        address: usize,
+        size: usize,
+        set_maximum: i32,
+        new_protection: i32,
+    ) -> i32;
+
+    fn _dyld_image_count() -> u32;
+    fn _dyld_get_image_name(image_index: u32) -> *const c_char;
+    fn _dyld_get_image_header(image_index: u32) -> *const c_void;
+
     fn getprogname() -> *const c_char;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 
@@ -72,13 +76,11 @@ unsafe extern "C" {
 
 const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
 
-// * 获取 objc_msgSend 函数指针，供不同签名按需转换
 #[inline]
 unsafe fn msg_send_ptr() -> *mut c_void {
     unsafe { dlsym(RTLD_DEFAULT, c"objc_msgSend".as_ptr()) }
 }
 
-// * 辅助函数：将 Rust 字符串转为 NSString 对象
 unsafe fn make_nsstring(s: &str) -> *mut c_void {
     let Ok(cstr) = CString::new(s) else {
         return std::ptr::null_mut();
@@ -92,7 +94,7 @@ unsafe fn make_nsstring(s: &str) -> *mut c_void {
     }
 }
 
-// * 4. 本地配置文件读写（持久化保存菜单栏热切换状态）
+// * 1. 本地配置文件读写与系统语言自动检测
 
 fn get_config_file_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/Shared".to_string());
@@ -103,9 +105,17 @@ fn get_config_file_path() -> PathBuf {
     dir.join("config.conf")
 }
 
+fn detect_default_english() -> bool {
+    if let Ok(lang) = std::env::var("LANG") {
+        return !lang.to_ascii_lowercase().starts_with("zh");
+    }
+    false
+}
+
 fn load_runtime_config() {
     let path = get_config_file_path();
     let Ok(content) = fs::read_to_string(path) else {
+        OPT_LANG_EN.store(detect_default_english(), Ordering::Relaxed);
         save_runtime_config();
         return;
     };
@@ -113,13 +123,15 @@ fn load_runtime_config() {
         let Some((k, v)) = line.split_once('=') else {
             continue;
         };
-        let enabled = v.trim() == "1" || v.trim().eq_ignore_ascii_case("true");
+        let val = v.trim();
+        let enabled =
+            val == "1" || val.eq_ignore_ascii_case("true") || val.eq_ignore_ascii_case("en");
         match k.trim() {
             "allow_screenshot" => OPT_ALLOW_SCREENSHOT.store(enabled, Ordering::Relaxed),
             "hide_sponsored" => OPT_HIDE_SPONSORED.store(enabled, Ordering::Relaxed),
             "unlock_copy" => OPT_UNLOCK_COPY.store(enabled, Ordering::Relaxed),
             "disable_sparkle" => OPT_DISABLE_SPARKLE.store(enabled, Ordering::Relaxed),
-            "local_premium_flag" => OPT_LOCAL_PREMIUM_FLAG.store(enabled, Ordering::Relaxed),
+            "lang_en" => OPT_LANG_EN.store(enabled, Ordering::Relaxed),
             _ => {}
         }
     }
@@ -128,17 +140,37 @@ fn load_runtime_config() {
 fn save_runtime_config() {
     let path = get_config_file_path();
     let body = format!(
-        "allow_screenshot={}\nhide_sponsored={}\nunlock_copy={}\ndisable_sparkle={}\nlocal_premium_flag={}\n",
+        "allow_screenshot={}\nhide_sponsored={}\nunlock_copy={}\ndisable_sparkle={}\nlang_en={}\n",
         usize::from(OPT_ALLOW_SCREENSHOT.load(Ordering::Relaxed)),
         usize::from(OPT_HIDE_SPONSORED.load(Ordering::Relaxed)),
         usize::from(OPT_UNLOCK_COPY.load(Ordering::Relaxed)),
         usize::from(OPT_DISABLE_SPARKLE.load(Ordering::Relaxed)),
-        usize::from(OPT_LOCAL_PREMIUM_FLAG.load(Ordering::Relaxed)),
+        usize::from(OPT_LANG_EN.load(Ordering::Relaxed)),
     );
     let _ = fs::write(path, body);
 }
 
-// * 5. 功能模块一：破除禁止截屏与录屏黑框限制 (NSWindow.sharingType & CaptureProtectedContentLayer)
+// * 2. 核心防闪退钩子：将受 macOS TCC 跨团队保护的 Group Container 重定向至 Application Support
+unsafe extern "C" fn hooked_container_url(
+    _this: *mut c_void,
+    _sel: *mut c_void,
+    _group_id: *mut c_void,
+) -> *mut c_void {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/Shared".to_string());
+    let container_dir = format!("{home}/Library/Application Support/TelegramPatcher/Container");
+    let _ = fs::create_dir_all(&container_dir);
+
+    unsafe {
+        let url_cls = objc_getClass(c"NSURL".as_ptr());
+        let sel = sel_registerName(c"fileURLWithPath:isDirectory:".as_ptr());
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, i8) -> *mut c_void =
+            std::mem::transmute(msg_send_ptr());
+        let ns_path = make_nsstring(&container_dir);
+        f(url_cls, sel, ns_path, 1)
+    }
+}
+
+// * 3. 破除禁止截屏与录屏黑框限制 (NSWindow.sharingType & NSView.protectedContent)
 
 static mut ORIG_SET_SHARING_TYPE: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, c_ulong)> =
     None;
@@ -152,8 +184,6 @@ unsafe extern "C" fn hooked_set_sharing_type(
     sel: *mut c_void,
     mut sharing_type: c_ulong,
 ) {
-    // ! NSWindowSharingNone = 0, NSWindowSharingReadOnly = 1
-    // ! 开启「允许截屏」时，强制将 0 (禁止截屏) 改写为 1 (允许读写截屏)
     if OPT_ALLOW_SCREENSHOT.load(Ordering::Relaxed) && sharing_type == 0 {
         sharing_type = 1;
     }
@@ -185,7 +215,6 @@ unsafe extern "C" fn hooked_set_protected_content(
     }
 }
 
-// * 实时刷新当前已打开的所有 Telegram 窗口的截屏权限
 unsafe fn refresh_all_windows_sharing_type() {
     if !OPT_ALLOW_SCREENSHOT.load(Ordering::Relaxed) {
         return;
@@ -224,7 +253,145 @@ unsafe fn refresh_all_windows_sharing_type() {
     }
 }
 
-// * 6. 功能模块二：屏蔽频道底部官方赞助商广告 (ChatSponsoredView)
+// * 4. ARM64 内存指令热修补：从 AdMessages.swift 源头彻底掐断频道伪装气泡广告
+
+struct AdPatchSpot {
+    addr: usize,
+    orig_insn: u32,
+    patch_insn: u32,
+}
+
+static AD_PATCH_SPOTS: std::sync::OnceLock<Vec<AdPatchSpot>> = std::sync::OnceLock::new();
+
+unsafe fn find_telegram_text_region() -> Option<(usize, &'static [u32])> {
+    unsafe {
+        let count = _dyld_image_count();
+        for i in 0..count {
+            let name_ptr = _dyld_get_image_name(i);
+            if name_ptr.is_null() {
+                continue;
+            }
+            let name_bytes = CStr::from_ptr(name_ptr).to_bytes();
+            if name_bytes.ends_with(b"/MacOS/Telegram") {
+                let base = _dyld_get_image_header(i) as usize;
+                let ncmds = *((base + 16) as *const u32) as usize;
+                let mut cur = base + 32;
+                for _ in 0..ncmds {
+                    let cmd = *(cur as *const u32);
+                    let cmdsize = *((cur + 4) as *const u32) as usize;
+                    if cmd == 0x19 {
+                        let segname = std::slice::from_raw_parts((cur + 8) as *const u8, 16);
+                        if segname.starts_with(b"__TEXT\0") {
+                            let vmsize = *((cur + 32) as *const u64) as usize;
+                            let words = std::slice::from_raw_parts(base as *const u32, vmsize / 4);
+                            return Some((base, words));
+                        }
+                    }
+                    cur += cmdsize;
+                }
+            }
+        }
+        None
+    }
+}
+
+fn resolve_ad_patch_spots() -> &'static [AdPatchSpot] {
+    AD_PATCH_SPOTS.get_or_init(|| {
+        let mut spots = Vec::new();
+        let Some((base, words)) = (unsafe { find_telegram_text_region() }) else {
+            return spots;
+        };
+
+        // * 关卡 1: AdMessagesHistoryContextImpl.init 本地 5 分钟缓存广告分支 (b.le -> NOP)
+        let off1 = 0x837bbc / 4;
+        if off1 < words.len() && words[off1] == 0x540002cd && words[off1 - 4] == 0x1e780108 {
+            spots.push(AdPatchSpot {
+                addr: base + off1 * 4,
+                orig_insn: 0x540002cd,
+                patch_insn: 0xd503201f,
+            });
+        } else if let Some(idx) = words
+            .windows(5)
+            .position(|w| w[0] == 0x1e780108 && w[1] == 0x7104b108 && w[3] == 0x6b1b011f)
+        {
+            spots.push(AdPatchSpot {
+                addr: base + (idx + 4) * 4,
+                orig_insn: words[idx + 4],
+                patch_insn: 0xd503201f,
+            });
+        }
+
+        // * 关卡 2: AdMessages 状态构建循环的广告数组长度 (ldr x27, [x19, #0x10] -> mov x27, #0)
+        let off2 = 0x837d1c / 4;
+        if off2 < words.len() && words[off2] == 0xf9400a7b && words[off2 + 1] == 0xd2800015 {
+            spots.push(AdPatchSpot {
+                addr: base + off2 * 4,
+                orig_insn: 0xf9400a7b,
+                patch_insn: 0xd280001b,
+            });
+        } else if let Some(idx) = words
+            .windows(3)
+            .position(|w| w[0] == 0xf9400a7b && w[1] == 0xd2800015 && w[2] == 0x92420b1c)
+        {
+            spots.push(AdPatchSpot {
+                addr: base + idx * 4,
+                orig_insn: 0xf9400a7b,
+                patch_insn: 0xd280001b,
+            });
+        }
+
+        // * 关卡 3: AdMessagesHistoryContextImpl.activate 网络拉取广告入口 (tbz -> NOP)
+        let off3 = 0x837f7c / 4;
+        if off3 < words.len() && words[off3] == 0x36000128 && words[off3 - 1] == 0x39420288 {
+            spots.push(AdPatchSpot {
+                addr: base + off3 * 4,
+                orig_insn: 0x36000128,
+                patch_insn: 0xd503201f,
+            });
+        } else if let Some(idx) = words.windows(3).position(|w| {
+            w[0] == 0x39420288 && (w[1] & 0xff00001f) == 0x36000008 && w[2] == 0xa9487bfd
+        }) {
+            spots.push(AdPatchSpot {
+                addr: base + (idx + 1) * 4,
+                orig_insn: words[idx + 1],
+                patch_insn: 0xd503201f,
+            });
+        }
+
+        spots
+    })
+}
+
+unsafe fn write_arm64_insn(addr: usize, insn: u32) {
+    unsafe {
+        let page_size = getpagesize() as usize;
+        let page_start = addr & !(page_size - 1);
+
+        if vm_protect(mach_task_self_, page_start, page_size, 0, 0x13) != 0
+            && vm_protect(mach_task_self_, page_start, page_size, 0, 0x03) != 0
+        {
+            return;
+        }
+
+        let ptr = addr as *mut u32;
+        *ptr = insn;
+
+        let _ = vm_protect(mach_task_self_, page_start, page_size, 0, 0x05);
+        sys_icache_invalidate(ptr as *mut c_void, 4);
+    }
+}
+
+unsafe fn apply_adblock_memory_patches(block_ads: bool) {
+    let spots = resolve_ad_patch_spots();
+    for spot in spots {
+        let target_insn = if block_ads {
+            spot.patch_insn
+        } else {
+            spot.orig_insn
+        };
+        unsafe { write_arm64_insn(spot.addr, target_insn) };
+    }
+}
 
 static mut ORIG_SPONSORED_LAYOUT: Option<unsafe extern "C" fn(*mut c_void, *mut c_void)> = None;
 
@@ -252,7 +419,7 @@ unsafe extern "C" fn hooked_sponsored_layout(this: *mut c_void, sel: *mut c_void
     }
 }
 
-// * 7. 功能模块三：解除受限群组/频道的禁止选中与右键菜单限制 (ChatInteraction & CopyProtectionRequestView)
+// * 5. 解除受限群组/频道的禁止选中与右键菜单限制
 
 static mut ORIG_CHAT_INTERACTION_INIT: Option<
     unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void,
@@ -261,7 +428,6 @@ static mut ORIG_CONTEXT_MENU_POPUP: Option<
     unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, *mut c_void),
 > = None;
 
-// * 将 ChatInteraction 实例内部的 disableSelectAbility 布尔成员变量清零
 unsafe fn clear_disable_select_ability(instance: *mut c_void) {
     if instance.is_null() || !OPT_UNLOCK_COPY.load(Ordering::Relaxed) {
         return;
@@ -302,14 +468,13 @@ unsafe extern "C" fn hooked_context_menu_popup(
     event: *mut c_void,
     view: *mut c_void,
 ) {
-    // * 弹出右键菜单前触发一次顶层菜单栏注入检查
     unsafe { ensure_patcher_menu_injected() };
     if let Some(orig) = unsafe { ORIG_CONTEXT_MENU_POPUP } {
         unsafe { orig(this, sel, menu, event, view) };
     }
 }
 
-// * 8. 功能模块四：拦截 Sparkle 自动更新检查（防止后台自动更新冲掉补丁）
+// * 6. 拦截 Sparkle 自动更新检查
 
 unsafe extern "C" fn noop_sparkle_check(
     _this: *mut c_void,
@@ -320,7 +485,7 @@ unsafe extern "C" fn noop_sparkle_check(
 
 unsafe extern "C" fn noop_sparkle_bg(_this: *mut c_void, _sel: *mut c_void) {}
 
-// * 9. 顶部系统菜单栏「⚡ 增强设置」动态挂载与实时响应
+// * 7. 顶部系统菜单栏「⚡ 增强设置 / ⚡ Patcher」动态挂载与中英文实时切换
 
 unsafe extern "C" fn on_toggle_screenshot(
     _this: *mut c_void,
@@ -344,7 +509,10 @@ unsafe extern "C" fn on_toggle_sponsored(
     let next = !OPT_HIDE_SPONSORED.load(Ordering::Relaxed);
     OPT_HIDE_SPONSORED.store(next, Ordering::Relaxed);
     save_runtime_config();
-    unsafe { set_menu_item_state(sender, next) };
+    unsafe {
+        set_menu_item_state(sender, next);
+        apply_adblock_memory_patches(next);
+    }
 }
 
 unsafe extern "C" fn on_toggle_unlock_copy(
@@ -369,6 +537,83 @@ unsafe extern "C" fn on_toggle_disable_sparkle(
     unsafe { set_menu_item_state(sender, next) };
 }
 
+unsafe extern "C" fn on_toggle_language(
+    _this: *mut c_void,
+    _sel: *mut c_void,
+    _sender: *mut c_void,
+) {
+    let next = !OPT_LANG_EN.load(Ordering::Relaxed);
+    OPT_LANG_EN.store(next, Ordering::Relaxed);
+    save_runtime_config();
+    unsafe { refresh_menu_titles(next) };
+}
+
+unsafe fn set_obj_title(obj: usize, title: &str) {
+    if obj == 0 {
+        return;
+    }
+    unsafe {
+        let f_title: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
+            std::mem::transmute(msg_send_ptr());
+        f_title(
+            obj as *mut c_void,
+            sel_registerName(c"setTitle:".as_ptr()),
+            make_nsstring(title),
+        );
+    }
+}
+
+// * 实时刷新菜单栏中英文标题文案
+unsafe fn refresh_menu_titles(is_en: bool) {
+    unsafe {
+        if is_en {
+            set_obj_title(MENU_SUB_PTR.load(Ordering::Relaxed), "⚡ Patcher");
+            set_obj_title(
+                ITEM_SS_PTR.load(Ordering::Relaxed),
+                "Allow Screenshots & Screen Recording",
+            );
+            set_obj_title(
+                ITEM_AD_PTR.load(Ordering::Relaxed),
+                "Block Channel Sponsored Ads (Re-enter Chat)",
+            );
+            set_obj_title(
+                ITEM_CP_PTR.load(Ordering::Relaxed),
+                "Unlock Copy & Text Selection in Protected Chats",
+            );
+            set_obj_title(
+                ITEM_SP_PTR.load(Ordering::Relaxed),
+                "Disable Sparkle Auto-Update Checks",
+            );
+            set_obj_title(
+                ITEM_LANG_PTR.load(Ordering::Relaxed),
+                "🌐 切换为简体中文 (Switch to Chinese)",
+            );
+        } else {
+            set_obj_title(MENU_SUB_PTR.load(Ordering::Relaxed), "⚡ 增强设置");
+            set_obj_title(
+                ITEM_SS_PTR.load(Ordering::Relaxed),
+                "强制允许截屏与录屏 (破除黑框)",
+            );
+            set_obj_title(
+                ITEM_AD_PTR.load(Ordering::Relaxed),
+                "屏蔽频道官方赞助广告 (重进频道生效)",
+            );
+            set_obj_title(
+                ITEM_CP_PTR.load(Ordering::Relaxed),
+                "解除受限群文字选中与复制限制",
+            );
+            set_obj_title(
+                ITEM_SP_PTR.load(Ordering::Relaxed),
+                "拦截 Sparkle 自动更新弹窗",
+            );
+            set_obj_title(
+                ITEM_LANG_PTR.load(Ordering::Relaxed),
+                "🌐 Switch to English (切换英文)",
+            );
+        }
+    }
+}
+
 unsafe fn set_menu_item_state(item: *mut c_void, enabled: bool) {
     if item.is_null() {
         return;
@@ -384,11 +629,11 @@ unsafe fn set_menu_item_state(item: *mut c_void, enabled: bool) {
     }
 }
 
-unsafe fn create_checkable_item(
+unsafe fn create_menu_item(
     title: &str,
     action_sel_name: *const c_char,
     target: *mut c_void,
-    initial_state: bool,
+    initial_state: Option<bool>,
 ) -> *mut c_void {
     unsafe {
         let item_cls = objc_getClass(c"NSMenuItem".as_ptr());
@@ -418,12 +663,13 @@ unsafe fn create_checkable_item(
         let f_target: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
             std::mem::transmute(msg_send_ptr());
         f_target(item, sel_registerName(c"setTarget:".as_ptr()), target);
-        set_menu_item_state(item, initial_state);
+        if let Some(st) = initial_state {
+            set_menu_item_state(item, st);
+        }
         item
     }
 }
 
-// * 在 Telegram 顶部系统菜单栏挂载「⚡ 增强设置」下拉菜单
 unsafe fn ensure_patcher_menu_injected() {
     unsafe {
         let app_cls = objc_getClass(c"NSApplication".as_ptr());
@@ -442,7 +688,6 @@ unsafe fn ensure_patcher_menu_injected() {
         }
 
         MENU_INJECTED.call_once(|| {
-            // * 注册自定义 ObjC 菜单事件接收类 TGPatcherMenuHandler
             let nsobject_cls = objc_getClass(c"NSObject".as_ptr());
             let handler_cls =
                 objc_allocateClassPair(nsobject_cls, c"TGPatcherMenuHandler".as_ptr(), 0);
@@ -471,6 +716,12 @@ unsafe fn ensure_patcher_menu_injected() {
                     on_toggle_disable_sparkle as *mut c_void,
                     c"v24@0:8@16".as_ptr(),
                 );
+                let _ = class_addMethod(
+                    handler_cls,
+                    sel_registerName(c"toggleLanguage:".as_ptr()),
+                    on_toggle_language as *mut c_void,
+                    c"v24@0:8@16".as_ptr(),
+                );
                 objc_registerClassPair(handler_cls);
             }
 
@@ -483,7 +734,6 @@ unsafe fn ensure_patcher_menu_injected() {
                 sel_registerName(c"init".as_ptr()),
             );
 
-            // * 创建顶层 NSMenuItem 与子菜单 NSMenu
             let menu_item_cls = objc_getClass(c"NSMenuItem".as_ptr());
             let top_item = f_obj(
                 f_obj(menu_item_cls, sel_registerName(c"alloc".as_ptr())),
@@ -506,37 +756,52 @@ unsafe fn ensure_patcher_menu_injected() {
                 std::mem::transmute(msg_send_ptr());
             let sel_add = sel_registerName(c"addItem:".as_ptr());
 
-            let item_ss = create_checkable_item(
-                "强制允许截屏与录屏 (破除黑框)",
+            let item_ss = create_menu_item(
+                "",
                 c"toggleScreenshot:".as_ptr(),
                 target_instance,
-                OPT_ALLOW_SCREENSHOT.load(Ordering::Relaxed),
+                Some(OPT_ALLOW_SCREENSHOT.load(Ordering::Relaxed)),
             );
-            let item_ad = create_checkable_item(
-                "屏蔽频道底部官方赞助广告",
+            let item_ad = create_menu_item(
+                "",
                 c"toggleSponsored:".as_ptr(),
                 target_instance,
-                OPT_HIDE_SPONSORED.load(Ordering::Relaxed),
+                Some(OPT_HIDE_SPONSORED.load(Ordering::Relaxed)),
             );
-            let item_cp = create_checkable_item(
-                "解除受限群文字选中与复制限制",
+            let item_cp = create_menu_item(
+                "",
                 c"toggleUnlockCopy:".as_ptr(),
                 target_instance,
-                OPT_UNLOCK_COPY.load(Ordering::Relaxed),
+                Some(OPT_UNLOCK_COPY.load(Ordering::Relaxed)),
             );
-            let item_sp = create_checkable_item(
-                "拦截 Sparkle 自动更新弹窗",
+            let item_sp = create_menu_item(
+                "",
                 c"toggleDisableSparkle:".as_ptr(),
                 target_instance,
-                OPT_DISABLE_SPARKLE.load(Ordering::Relaxed),
+                Some(OPT_DISABLE_SPARKLE.load(Ordering::Relaxed)),
             );
+            let sep_item = f_obj(menu_item_cls, sel_registerName(c"separatorItem".as_ptr()));
+            let item_lang =
+                create_menu_item("", c"toggleLanguage:".as_ptr(), target_instance, None);
+
+            MENU_SUB_PTR.store(sub_menu as usize, Ordering::Relaxed);
+            ITEM_SS_PTR.store(item_ss as usize, Ordering::Relaxed);
+            ITEM_AD_PTR.store(item_ad as usize, Ordering::Relaxed);
+            ITEM_CP_PTR.store(item_cp as usize, Ordering::Relaxed);
+            ITEM_SP_PTR.store(item_sp as usize, Ordering::Relaxed);
+            ITEM_LANG_PTR.store(item_lang as usize, Ordering::Relaxed);
+
+            refresh_menu_titles(OPT_LANG_EN.load(Ordering::Relaxed));
 
             f_add_item(sub_menu, sel_add, item_ss);
             f_add_item(sub_menu, sel_add, item_ad);
             f_add_item(sub_menu, sel_add, item_cp);
             f_add_item(sub_menu, sel_add, item_sp);
+            if !sep_item.is_null() {
+                f_add_item(sub_menu, sel_add, sep_item);
+            }
+            f_add_item(sub_menu, sel_add, item_lang);
 
-            // * 绑定子菜单并追加到 NSApp.mainMenu 末尾
             f_add_item(
                 top_item,
                 sel_registerName(c"setSubmenu:".as_ptr()),
@@ -549,7 +814,7 @@ unsafe fn ensure_patcher_menu_injected() {
     }
 }
 
-// * 10. 钩子统一扫描与挂载入口
+// * 8. 钩子统一扫描与挂载入口
 
 static mut ORIG_FINISH_LAUNCHING: Option<unsafe extern "C" fn(*mut c_void, *mut c_void)> = None;
 
@@ -565,7 +830,19 @@ unsafe extern "C" fn hooked_finish_launching(this: *mut c_void, sel: *mut c_void
 
 unsafe fn install_objc_hooks() {
     unsafe {
-        // * 1. Hook NSApplication.finishLaunching 以挂载顶部「⚡ 增强设置」菜单
+        // * 0. 优先 Hook NSFileManager.containerURLForSecurityApplicationGroupIdentifier: 彻底绕过 TCC 弹窗与闪退
+        let fm_cls = objc_getClass(c"NSFileManager".as_ptr());
+        if !fm_cls.is_null() {
+            let m_url = class_getInstanceMethod(
+                fm_cls,
+                sel_registerName(c"containerURLForSecurityApplicationGroupIdentifier:".as_ptr()),
+            );
+            if !m_url.is_null() {
+                method_setImplementation(m_url, hooked_container_url as *mut c_void);
+            }
+        }
+
+        // * 1. Hook NSApplication.finishLaunching 以挂载顶部「⚡ 增强设置 / ⚡ Patcher」菜单
         let app_cls = objc_getClass(c"NSApplication".as_ptr());
         if !app_cls.is_null() {
             let m = class_getInstanceMethod(app_cls, sel_registerName(c"finishLaunching".as_ptr()));
@@ -651,7 +928,7 @@ unsafe fn install_objc_hooks() {
             }
         }
 
-        // * 6. 动态遍历类列表，模糊匹配带有私密哈希的 ChatSponsoredView 并替换 layout
+        // * 6. 动态遍历类列表，模糊匹配 ChatSponsoredView 并替换 layout
         let mut class_count: u32 = 0;
         let classes = objc_copyClassList(&mut class_count);
         if !classes.is_null() {
@@ -665,7 +942,6 @@ unsafe fn install_objc_hooks() {
                     continue;
                 }
                 let name_bytes = CStr::from_ptr(name_ptr).to_bytes();
-                // ! 忽略中间随版本变动的 P33_... 私有哈希，直接匹配前缀 _TtC6ChatUI 与后缀 ChatSponsoredView
                 if name_bytes.starts_with(b"_TtC6ChatUI")
                     && name_bytes.ends_with(b"ChatSponsoredView")
                 {
@@ -690,25 +966,17 @@ pub unsafe extern "C" fn init_tg_patch() {
         return;
     }
     let prog_bytes = unsafe { CStr::from_ptr(prog).to_bytes() };
-    // ! 仅针对 Telegram 主进程生效，跳过 TelegramShare 等插件子进程
     if prog_bytes != b"Telegram" {
         return;
     }
 
     load_runtime_config();
-    unsafe { install_objc_hooks() };
-
-    // * 启动守护协程：在主界面加载完毕后兜底确保顶部菜单栏「⚡ 增强设置」成功显示
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(1200));
-        unsafe {
-            ensure_patcher_menu_injected();
-            refresh_all_windows_sharing_type();
-        }
-    });
+    unsafe {
+        apply_adblock_memory_patches(OPT_HIDE_SPONSORED.load(Ordering::Relaxed));
+        install_objc_hooks();
+    }
 }
 
-// * 注册 Mach-O 构造函数入口
 #[used]
 #[unsafe(link_section = "__DATA,__mod_init_func")]
 pub static INIT_FUNC: unsafe extern "C" fn() = init_tg_patch;

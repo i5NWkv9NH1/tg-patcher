@@ -1,4 +1,4 @@
-// * 组件精简与架构瘦身切片：剥离 x86_64 冗余架构并清理多余语言包
+// * 组件精简与架构精简切片：剥离 x86_64 冗余架构并清理多余语言包
 
 use std::fs;
 use std::io::Read;
@@ -37,6 +37,34 @@ pub fn format_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+// * 0. 移除无用组件 (42MB 的 TelegramShare.appex 分享扩展与 Sparkle Autoupdate.app)
+pub fn remove_bloatware(app_path: &Path) -> Result<Vec<String>, std::io::Error> {
+    let mut removed = Vec::new();
+    let targets = [
+        app_path.join("Contents/PlugIns/TelegramShare.appex"),
+        app_path.join("Contents/Frameworks/Sparkle.framework/Versions/A/Resources/Autoupdate.app"),
+        app_path.join("Contents/Frameworks/Sparkle.framework/Versions/A/Updater.app"),
+    ];
+
+    for target in &targets {
+        if target.exists() {
+            if target.is_dir() {
+                fs::remove_dir_all(target)?;
+            } else {
+                fs::remove_file(target)?;
+            }
+            let name = target
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            removed.push(name);
+        }
+    }
+
+    Ok(removed)
 }
 
 // * 1. 清理 Contents/Resources 与 Frameworks 内多余的 .lproj 语言包（仅保留英文与中文）
