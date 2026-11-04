@@ -1,0 +1,20 @@
+[package]
+name = "tg-patcher"
+version = "0.1.0"
+edition = "2024"
+authors = ["sora"]
+description = "macOS 原生 Telegram 客户端 (Telegram-Mac) 增强补丁、热切换菜单与架构瘦身工具"
+repository = "https://github.com/i5NWkv9NH1/tg-patcher"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+dialoguer = "0.11"
+console = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+walkdir = "2.5"
+thiserror = "1.0"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
