@@ -1,10 +1,8 @@
-// * 二进制处理切片：负责 Mach-O 尾部 LC_LOAD_DYLIB 注入与 ARM64 机器码交叉引用分析
-
+// * 二进制处理模块：Mach-O 尾部 LC_LOAD_DYLIB 注入、ARM64 交叉引用扫描与去广告特征验证
 use std::fs;
 use std::path::Path;
 use tracing::{debug, error, warn};
 
-// * Mach-O 与 FAT 核心魔数与常量定义
 pub const MH_MAGIC_64: u32 = 0xfeedfacf;
 pub const MH_CIGAM_64: u32 = 0xcffaedfe;
 pub const FAT_MAGIC: u32 = 0xcafebabe;
@@ -14,18 +12,13 @@ pub const LC_LOAD_DYLIB: u32 = 0x0000000c;
 pub const LC_SEGMENT_64: u32 = 0x00000019;
 pub const LC_FUNCTION_STARTS: u32 = 0x00000026;
 
-// * 注入执行结果枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InjectResult {
-    // * 动态库已成功追加写入加载表末尾
     Injected,
-    // * 动态库已在加载表末尾，无需重复操作
     AlreadyPresent,
-    // * 修复了不在末尾的错位项，并重新追加至末尾
     FixedAndInjected,
 }
 
-// * ARM64 字符串交叉引用探测结果
 #[derive(Debug, Clone)]
 pub struct Arm64XrefMatch {
     pub needle: String,
@@ -35,7 +28,12 @@ pub struct Arm64XrefMatch {
     pub prologue_insns: [u32; 4],
 }
 
-// * Mach-O 操作异常枚举
+#[derive(Debug, Clone)]
+pub struct AdBlockSpotReport {
+    pub name: &'static str,
+    pub matched_vas: Vec<u64>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MachoError {
     #[error("文件 I/O 异常: {0}")]
@@ -52,21 +50,17 @@ pub enum MachoError {
     HeaderPaddingNotZero,
 }
 
-// * 解析 Mach-O 头部以获取 arm64 切片的起始偏移与长度
 pub fn find_arm64_slice_range(data: &[u8]) -> Result<(usize, usize), MachoError> {
     if data.len() < 4 {
         return Err(MachoError::Corrupted("文件长度小于 4 字节".to_string()));
     }
-
     let magic = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
-
     if magic == FAT_MAGIC || magic == FAT_CIGAM {
         debug!("检测到 Universal 通用二进制 (FAT 容器)");
         if data.len() < 8 {
             return Err(MachoError::Corrupted("FAT 头部长度不足".to_string()));
         }
         let nfat_arch = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
-        // ! 校验架构数量在 1..=8 之间，避免与同样使用 0xCAFEBABE 的 Java class 文件冲突
         if nfat_arch == 0 || nfat_arch > 8 {
             return Err(MachoError::Corrupted(format!(
                 "FAT 架构数量异常 ({nfat_arch})"
@@ -95,7 +89,6 @@ pub fn find_arm64_slice_range(data: &[u8]) -> Result<(usize, usize), MachoError>
                 data[offset + 14],
                 data[offset + 15],
             ]) as usize;
-
             if cputype == CPU_TYPE_ARM64 {
                 if slice_offset + slice_size > data.len() {
                     return Err(MachoError::Corrupted("arm64 切片范围越界".to_string()));
@@ -113,12 +106,10 @@ pub fn find_arm64_slice_range(data: &[u8]) -> Result<(usize, usize), MachoError>
     }
 }
 
-// * 兼容仅需起始偏移量的调用方
 pub fn find_arm64_slice_offset(data: &[u8]) -> Result<usize, MachoError> {
     find_arm64_slice_range(data).map(|(off, _)| off)
 }
 
-// * 在指定的 Mach-O 字节流中对 arm64 切片注入 LC_LOAD_DYLIB
 pub fn inject_slice(
     data: &mut [u8],
     slice_offset: usize,
@@ -129,20 +120,17 @@ pub fn inject_slice(
             "切片数据小于 mach_header_64 尺寸".to_string(),
         ));
     }
-
     let magic = u32::from_le_bytes([
         data[slice_offset],
         data[slice_offset + 1],
         data[slice_offset + 2],
         data[slice_offset + 3],
     ]);
-
     if magic != MH_MAGIC_64 {
         return Err(MachoError::Corrupted(format!(
             "切片魔数非 MH_MAGIC_64: 0x{magic:x}"
         )));
     }
-
     let mut ncmds = u32::from_le_bytes([
         data[slice_offset + 16],
         data[slice_offset + 17],
@@ -155,29 +143,23 @@ pub fn inject_slice(
         data[slice_offset + 22],
         data[slice_offset + 23],
     ]);
-
     let cmds_start = slice_offset + 32;
     let mut cmds_end = cmds_start + sizeofcmds as usize;
-
     if data.len() < cmds_end {
         return Err(MachoError::Corrupted(
             "加载命令总长度超出切片边界".to_string(),
         ));
     }
-
     let path_bytes = dylib_path.as_bytes();
     let path_len_with_null = path_bytes.len() + 1;
     let add_cmdsize = ((24 + path_len_with_null + 7) & !7) as u32;
-
     let mut cursor = cmds_start;
     let mut fixed_misplaced = false;
-
     let mut i = 0;
     while i < ncmds {
         if cursor + 8 > cmds_end {
             return Err(MachoError::Corrupted("遍历加载命令时发生越界".to_string()));
         }
-
         let cmd = u32::from_le_bytes([
             data[cursor],
             data[cursor + 1],
@@ -190,13 +172,11 @@ pub fn inject_slice(
             data[cursor + 6],
             data[cursor + 7],
         ]) as usize;
-
         if cmdsize < 8 || cursor + cmdsize > cmds_end {
             return Err(MachoError::Corrupted(format!(
                 "加载命令尺寸异常: cmd=0x{cmd:x}, size={cmdsize}"
             )));
         }
-
         if cmd == LC_LOAD_DYLIB && cmdsize >= 24 {
             let name_offset = u32::from_le_bytes([
                 data[cursor + 8],
@@ -204,24 +184,20 @@ pub fn inject_slice(
                 data[cursor + 10],
                 data[cursor + 11],
             ]) as usize;
-
             if name_offset < cmdsize && cursor + name_offset < cmds_end {
                 let str_bytes = &data[cursor + name_offset..cursor + cmdsize];
                 let parsed_name =
                     std::str::from_utf8(str_bytes.split(|&b| b == 0).next().unwrap_or_default())
                         .unwrap_or_default();
-
                 if parsed_name == dylib_path {
                     if i == ncmds - 1 {
                         debug!("补丁已存在于加载表最末尾，无需重复写入");
                         return Ok(InjectResult::AlreadyPresent);
                     }
-
                     warn!("检测到错位项，正在剔除并重排加载命令表...");
                     let copy_src = cursor + cmdsize;
                     let copy_len = cmds_end - copy_src;
                     data.copy_within(copy_src..copy_src + copy_len, cursor);
-
                     ncmds -= 1;
                     sizeofcmds -= cmdsize as u32;
                     cmds_end -= cmdsize;
@@ -231,22 +207,17 @@ pub fn inject_slice(
                 }
             }
         }
-
         cursor += cmdsize;
         i += 1;
     }
-
     if data.len() < cmds_end + add_cmdsize as usize {
         return Err(MachoError::NoSpaceAvailable);
     }
-
-    // ! 检查即将写入的预留填充区是否全为 0，防止覆盖后续代码段
     let target_range = cmds_end..cmds_end + add_cmdsize as usize;
     if data[target_range.clone()].iter().any(|&b| b != 0) {
         error!("Mach-O 头部预留填充区包含非零数据，为保护后续代码段已终止写入");
         return Err(MachoError::HeaderPaddingNotZero);
     }
-
     let mut new_cmd = vec![0u8; add_cmdsize as usize];
     new_cmd[0..4].copy_from_slice(&LC_LOAD_DYLIB.to_le_bytes());
     new_cmd[4..8].copy_from_slice(&add_cmdsize.to_le_bytes());
@@ -254,18 +225,13 @@ pub fn inject_slice(
     new_cmd[12..16].copy_from_slice(&2u32.to_le_bytes());
     new_cmd[16..20].copy_from_slice(&0x00010000u32.to_le_bytes());
     new_cmd[20..24].copy_from_slice(&0x00010000u32.to_le_bytes());
-
     new_cmd[24..24 + path_bytes.len()].copy_from_slice(path_bytes);
     new_cmd[24 + path_bytes.len()] = 0;
-
     data[target_range].copy_from_slice(&new_cmd);
-
     ncmds += 1;
     sizeofcmds += add_cmdsize;
-
     data[slice_offset + 16..slice_offset + 20].copy_from_slice(&ncmds.to_le_bytes());
     data[slice_offset + 20..slice_offset + 24].copy_from_slice(&sizeofcmds.to_le_bytes());
-
     if fixed_misplaced {
         Ok(InjectResult::FixedAndInjected)
     } else {
@@ -273,46 +239,44 @@ pub fn inject_slice(
     }
 }
 
-// * 对指定二进制文件执行加载表注入
 pub fn inject_file<P: AsRef<Path>>(path: P, dylib_path: &str) -> Result<InjectResult, MachoError> {
     let path_ref = path.as_ref();
     let mut data = fs::read(path_ref)?;
     let slice_offset = find_arm64_slice_offset(&data)?;
     let result = inject_slice(&mut data, slice_offset, dylib_path)?;
-
     if result != InjectResult::AlreadyPresent {
         fs::write(path_ref, &data)?;
     }
-
     Ok(result)
 }
 
-// * 解析 Mach-O 的 __TEXT 段信息与 LC_FUNCTION_STARTS 表，对指定特征字符串执行 ARM64 ADRP+ADD 交叉引用扫描
-pub fn scan_arm64_string_xrefs(
-    file_data: &[u8],
-    needles: &[&str],
-) -> Result<Vec<Arm64XrefMatch>, MachoError> {
-    let (slice_off, slice_len) = find_arm64_slice_range(file_data)?;
-    let slice = &file_data[slice_off..slice_off + slice_len];
+struct TextLayout {
+    text_vmaddr: u64,
+    text_fileoff: usize,
+    text_filesize: usize,
+    code_sec_offset: usize,
+    code_sec_size: usize,
+    func_starts_off: usize,
+    func_starts_size: usize,
+}
 
+fn parse_text_layout(slice: &[u8]) -> Result<TextLayout, MachoError> {
     if slice.len() < 32 {
         return Err(MachoError::Corrupted("arm64 切片长度不足".to_string()));
     }
-
     let ncmds = u32::from_le_bytes([slice[16], slice[17], slice[18], slice[19]]) as usize;
     let sizeofcmds = u32::from_le_bytes([slice[20], slice[21], slice[22], slice[23]]) as usize;
-
-    let mut text_vmaddr: u64 = 0x100000000;
-    let mut text_fileoff: usize = 0;
-    let mut code_sec_offset: usize = 0;
-    let mut code_sec_size: usize = 0;
-    let mut func_starts_off: usize = 0;
-    let mut func_starts_size: usize = 0;
-
+    let mut layout = TextLayout {
+        text_vmaddr: 0x100000000,
+        text_fileoff: 0,
+        text_filesize: 0,
+        code_sec_offset: 0,
+        code_sec_size: 0,
+        func_starts_off: 0,
+        func_starts_size: 0,
+    };
     let mut cursor = 32;
     let cmds_end = (32 + sizeofcmds).min(slice.len());
-
-    // * 1. 遍历加载命令，提取 __TEXT 段基址、__text 代码节范围以及 LC_FUNCTION_STARTS 表
     for _ in 0..ncmds {
         if cursor + 8 > cmds_end {
             break;
@@ -332,18 +296,19 @@ pub fn scan_arm64_string_xrefs(
         if cmdsize < 8 || cursor + cmdsize > cmds_end {
             break;
         }
-
         if cmd == LC_SEGMENT_64 && cmdsize >= 72 {
             let segname = &slice[cursor + 8..cursor + 24];
             if segname.starts_with(b"__TEXT\0") {
-                text_vmaddr =
+                layout.text_vmaddr =
                     u64::from_le_bytes(slice[cursor + 24..cursor + 32].try_into().unwrap());
-                text_fileoff =
+                layout.text_fileoff =
                     u64::from_le_bytes(slice[cursor + 40..cursor + 48].try_into().unwrap())
+                        as usize;
+                layout.text_filesize =
+                    u64::from_le_bytes(slice[cursor + 48..cursor + 56].try_into().unwrap())
                         as usize;
                 let nsects = u32::from_le_bytes(slice[cursor + 64..cursor + 68].try_into().unwrap())
                     as usize;
-
                 let mut sec_cursor = cursor + 72;
                 for _ in 0..nsects {
                     if sec_cursor + 80 > cursor + cmdsize {
@@ -351,10 +316,10 @@ pub fn scan_arm64_string_xrefs(
                     }
                     let sectname = &slice[sec_cursor..sec_cursor + 16];
                     if sectname.starts_with(b"__text\0") {
-                        code_sec_size = u64::from_le_bytes(
+                        layout.code_sec_size = u64::from_le_bytes(
                             slice[sec_cursor + 40..sec_cursor + 48].try_into().unwrap(),
                         ) as usize;
-                        code_sec_offset = u32::from_le_bytes(
+                        layout.code_sec_offset = u32::from_le_bytes(
                             slice[sec_cursor + 48..sec_cursor + 52].try_into().unwrap(),
                         ) as usize;
                     }
@@ -362,21 +327,81 @@ pub fn scan_arm64_string_xrefs(
                 }
             }
         } else if cmd == LC_FUNCTION_STARTS && cmdsize >= 16 {
-            func_starts_off =
+            layout.func_starts_off =
                 u32::from_le_bytes(slice[cursor + 8..cursor + 12].try_into().unwrap()) as usize;
-            func_starts_size =
+            layout.func_starts_size =
                 u32::from_le_bytes(slice[cursor + 12..cursor + 16].try_into().unwrap()) as usize;
         }
-
         cursor += cmdsize;
     }
+    Ok(layout)
+}
 
-    // * 2. 解码 ULEB128 格式的 LC_FUNCTION_STARTS，拿到所有被 Strip 函数的精确入口虚拟地址
+// * 离线验证 3 处去广告指令特征码在当前 Telegram 版本中的命中情况
+pub fn verify_adblock_signatures(file_data: &[u8]) -> Result<Vec<AdBlockSpotReport>, MachoError> {
+    let (slice_off, slice_len) = find_arm64_slice_range(file_data)?;
+    let slice = &file_data[slice_off..slice_off + slice_len];
+    let layout = parse_text_layout(slice)?;
+    let mut reports = vec![
+        AdBlockSpotReport {
+            name: "关卡1: 本地5分钟缓存广告分支 (b.le -> NOP)",
+            matched_vas: Vec::new(),
+        },
+        AdBlockSpotReport {
+            name: "关卡2: 广告数组长度读取 (ldr x27 -> mov x27, #0)",
+            matched_vas: Vec::new(),
+        },
+        AdBlockSpotReport {
+            name: "关卡3: 网络拉取广告激活分支 (tbz -> NOP)",
+            matched_vas: Vec::new(),
+        },
+    ];
+    if layout.code_sec_offset == 0 || layout.code_sec_offset + layout.code_sec_size > slice.len() {
+        return Ok(reports);
+    }
+    let code_bytes = &slice[layout.code_sec_offset..layout.code_sec_offset + layout.code_sec_size];
+    let code_base_va =
+        layout.text_vmaddr + (layout.code_sec_offset.saturating_sub(layout.text_fileoff)) as u64;
+    let words: Vec<u32> = code_bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    for (idx, w) in words.windows(5).enumerate() {
+        if w[0] == 0x1e780108 && w[1] == 0x7104b108 && w[3] == 0x6b1b011f {
+            reports[0]
+                .matched_vas
+                .push(code_base_va + ((idx + 4) * 4) as u64);
+        }
+    }
+    for (idx, w) in words.windows(3).enumerate() {
+        if w[0] == 0xf9400a7b && w[1] == 0xd2800015 && w[2] == 0x92420b1c {
+            reports[1].matched_vas.push(code_base_va + (idx * 4) as u64);
+        }
+        if w[0] == 0x39420288 && (w[1] & 0xff00001f) == 0x36000008 && w[2] == 0xa9487bfd {
+            reports[2]
+                .matched_vas
+                .push(code_base_va + ((idx + 1) * 4) as u64);
+        }
+    }
+    Ok(reports)
+}
+
+// * 解析 __TEXT 段与 LC_FUNCTION_STARTS 表，对特征字符串执行 ARM64 ADRP+ADD 交叉引用扫描
+pub fn scan_arm64_string_xrefs(
+    file_data: &[u8],
+    needles: &[&str],
+) -> Result<Vec<Arm64XrefMatch>, MachoError> {
+    let (slice_off, slice_len) = find_arm64_slice_range(file_data)?;
+    let slice = &file_data[slice_off..slice_off + slice_len];
+    let layout = parse_text_layout(slice)?;
+
     let mut function_starts = Vec::new();
-    if func_starts_off > 0 && func_starts_off + func_starts_size <= slice.len() {
-        let mut addr = text_vmaddr;
-        let mut idx = func_starts_off;
-        let end = func_starts_off + func_starts_size;
+    if layout.func_starts_off > 0 && layout.func_starts_off + layout.func_starts_size <= slice.len()
+    {
+        let mut addr = layout.text_vmaddr;
+        let mut idx = layout.func_starts_off;
+        let end = layout.func_starts_off + layout.func_starts_size;
         while idx < end {
             let mut delta: u64 = 0;
             let mut shift = 0;
@@ -400,48 +425,59 @@ pub fn scan_arm64_string_xrefs(
         }
     }
 
-    // * 3. 搜索目标字符串，并自动向前回溯到 '\0' 边界以获取整条 C 字符串的真实起始虚拟地址
+    // * 仅在 __TEXT 段范围内检索字符串，确保虚拟地址换算准确
+    let text_end = (layout.text_fileoff + layout.text_filesize).min(slice.len());
+    let text_slice = &slice[layout.text_fileoff..text_end];
     let mut targets: std::collections::HashMap<u64, &str> = std::collections::HashMap::new();
     for &needle in needles {
         let nb = needle.as_bytes();
-        if nb.is_empty() || slice.len() < nb.len() {
+        if nb.is_empty() || text_slice.len() < nb.len() {
             continue;
         }
         let mut search_from = 0;
-        while let Some(rel_pos) = slice[search_from..].windows(nb.len()).position(|w| w == nb) {
+        while let Some(rel_pos) = text_slice[search_from..]
+            .windows(nb.len())
+            .position(|w| w == nb)
+        {
             let pos = search_from + rel_pos;
-            // ! 向前回溯到上一个 '\0' 字节，定位如 "/Users/.../CopyProtection.swift" 的真正首字节 '/'
             let mut cstr_start = pos;
-            while cstr_start > 0 && slice[cstr_start - 1] != 0 && (pos - cstr_start) < 256 {
+            while cstr_start > 0 && text_slice[cstr_start - 1] != 0 && (pos - cstr_start) < 256 {
                 cstr_start -= 1;
             }
-
-            let exact_va = text_vmaddr + (pos.saturating_sub(text_fileoff)) as u64;
-            let start_va = text_vmaddr + (cstr_start.saturating_sub(text_fileoff)) as u64;
+            let exact_va = layout.text_vmaddr + pos as u64;
+            let start_va = layout.text_vmaddr + cstr_start as u64;
             targets.insert(exact_va, needle);
             targets.insert(start_va, needle);
-
             search_from = pos + nb.len();
         }
     }
 
     let mut results = Vec::new();
-    if code_sec_offset == 0 || code_sec_offset + code_sec_size > slice.len() || targets.is_empty() {
+    if layout.code_sec_offset == 0
+        || layout.code_sec_offset + layout.code_sec_size > slice.len()
+        || targets.is_empty()
+    {
         return Ok(results);
     }
+    let code_bytes = &slice[layout.code_sec_offset..layout.code_sec_offset + layout.code_sec_size];
+    let code_base_va =
+        layout.text_vmaddr + (layout.code_sec_offset.saturating_sub(layout.text_fileoff)) as u64;
 
-    let code_bytes = &slice[code_sec_offset..code_sec_offset + code_sec_size];
-    let code_base_va = text_vmaddr + (code_sec_offset.saturating_sub(text_fileoff)) as u64;
-
-    // * 4. 维护 32 个通用寄存器的最近一次 ADRP 页基址状态：(page_va, adrp_pc)
     let mut adrp_regs: [(u64, u64); 32] = [(0, 0); 32];
     let insn_count = code_bytes.len() / 4;
-
     for i in 0..insn_count {
         let insn = u32::from_le_bytes(code_bytes[i * 4..i * 4 + 4].try_into().unwrap());
         let pc = code_base_va + (i as u64) * 4;
 
-        // * 分支 A: 识别 ADRP Xd, page 指令
+        // * 遇到函数调用 BL / BLR 时清空调用者保存寄存器 x0..=x18，减少误报
+        if (insn & 0xFC000000) == 0x94000000 || (insn & 0xFFFFFC1F) == 0xD63F0000 {
+            for slot in adrp_regs.iter_mut().take(19) {
+                *slot = (0, 0);
+            }
+            continue;
+        }
+
+        // * ADRP Xd, page
         if (insn & 0x9F000000) == 0x90000000 {
             let rd = (insn & 0x1F) as usize;
             let immlo = (insn >> 29) & 0x3;
@@ -454,14 +490,12 @@ pub fn scan_arm64_string_xrefs(
             continue;
         }
 
-        // * 分支 B: 识别 64位 ADD Xd, Xn, #imm12 指令 (shift = 0)
+        // * 64位 ADD Xd, Xn, #imm12
         if (insn & 0xFFC00000) == 0x91000000 {
             let rn = ((insn >> 5) & 0x1F) as usize;
             let rd = (insn & 0x1F) as usize;
             let imm12 = ((insn >> 10) & 0xFFF) as u64;
-
             let (page_va, adrp_pc) = adrp_regs[rn];
-            // ! 若 Xn 在最近 16 条指令 (64 字节) 内刚由 ADRP 赋值，则组合计算出目标虚拟地址
             if page_va != 0 && pc.saturating_sub(adrp_pc) <= 64 {
                 let resolved_va = page_va + imm12;
                 if let Some(&needle) = targets.get(&resolved_va) {
@@ -470,7 +504,6 @@ pub fn scan_arm64_string_xrefs(
                         Err(insert_idx) if insert_idx > 0 => Some(function_starts[insert_idx - 1]),
                         _ => None,
                     };
-
                     let mut prologue = [0u32; 4];
                     if let Some(f_va) = func_start
                         && f_va >= code_base_va
@@ -486,7 +519,6 @@ pub fn scan_arm64_string_xrefs(
                             }
                         }
                     }
-
                     results.push(Arm64XrefMatch {
                         needle: needle.to_string(),
                         string_va: resolved_va,
@@ -496,12 +528,10 @@ pub fn scan_arm64_string_xrefs(
                     });
                 }
             }
-            // ! 若 ADD 覆写了某寄存器但不是基于其自身的 ADRP，清除旧状态避免误判
             if rd != rn {
                 adrp_regs[rd] = (0, 0);
             }
         }
     }
-
     Ok(results)
 }
